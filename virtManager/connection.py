@@ -1332,6 +1332,10 @@ class vmmConnection(vmmGObject):
             initial_poll, pollvm, pollnet, pollpool, polliface, pollnodedev)
         self.idle_add(self._gone_object_signals, gone_objects)
 
+        if stats_update:
+            self._getdomstats(
+                [o for o in preexisting_objects if o.reports_stats()], pollvm)
+
         # Only tick() pre-existing objects, since new objects will be
         # initialized asynchronously and tick() would be redundant
         for obj in preexisting_objects:
@@ -1349,7 +1353,7 @@ class vmmConnection(vmmGObject):
                 elif obj.__class__ is vmmNodeDevice and not pollnodedev:
                     continue
 
-                obj.tick(stats_update=stats_update)
+#                obj.tick(stats_update=stats_update)
             except Exception as e:
                 logging.exception("Tick for %s failed", obj)
                 if (isinstance(e, libvirt.libvirtError) and
@@ -1365,6 +1369,57 @@ class vmmConnection(vmmGObject):
             self._recalculate_stats(
                 [o for o in preexisting_objects if o.reports_stats()])
             self.idle_emit("resources-sampled")
+
+    def _getdomstats(self, vms, pollvm):
+        try:
+            stats = self._backend.getAllDomainStats(
+                libvirt.VIR_DOMAIN_STATS_STATE |
+                libvirt.VIR_DOMAIN_STATS_CPU_TOTAL |
+                libvirt.VIR_DOMAIN_STATS_VCPU |
+                libvirt.VIR_DOMAIN_STATS_BALLOON |
+                libvirt.VIR_DOMAIN_STATS_BLOCK |
+                libvirt.VIR_DOMAIN_STATS_INTERFACE,
+                0)
+        except libvirt.libvirtError as err:
+            logging.debug("Error reading stats: %s", err)
+
+        for obj in vms:
+            for domstat in stats:
+                if obj._backend.UUID() == domstat[0].UUID():
+                    now = time.time()
+
+                    #get cpu stats
+                    (cpuTime, cpuTimeAbs, pcentHostCpu,
+                     pcentGuestCpu) = obj.sample_cpu_stats(domstat[1], now)
+
+                    #get memory stats
+                    pcentCurrMem, curmem = obj.sample_mem_stats(domstat[1])
+
+                    #get block stats
+                    rdBytes, wrBytes = obj.sample_disk_io(domstat[1])
+
+                    #get interface stats
+                    rxBytes, txBytes = obj.sample_network_traffic(domstat[1])
+
+                    newStats = {
+                        "timestamp": now,
+                        "cpuTime": cpuTime,
+                        "cpuTimeAbs": cpuTimeAbs,
+                        "cpuHostPercent": pcentHostCpu,
+                        "cpuGuestPercent": pcentGuestCpu,
+                        "curmem": curmem,
+                        "currMemPercent": pcentCurrMem,
+                        "diskRdKiB": rdBytes // 1024,
+                        "diskWrKiB": wrBytes // 1024,
+                        "netRxKiB": rxBytes // 1024,
+                        "netTxKiB": txBytes // 1024,
+                    }
+
+                    for r in ["diskRd", "diskWr", "netRx", "netTx"]:
+                        newStats[r + "Rate"] = obj._get_cur_rate(r + "KiB")
+                        obj._set_max_rate(newStats, r + "Rate")
+
+                    obj._stats.insert(0, newStats)
 
     def _recalculate_stats(self, vms):
         if not self._backend.is_open():

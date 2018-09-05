@@ -1467,11 +1467,9 @@ class vmmDomain(vmmLibvirtObject):
     # Stats helpers #
     #################
 
-    def _sample_cpu_stats(self, info, now):
+    def sample_cpu_stats(self, info, now):
         if not self._enable_cpu_stats:
             return 0, 0, 0, 0
-        if not info:
-            info = self._backend.info()
 
         prevCpuTime = 0
         prevTimestamp = 0
@@ -1484,11 +1482,11 @@ class vmmDomain(vmmLibvirtObject):
             prevTimestamp = self._stats[0]["timestamp"]
             prevCpuTime = self._stats[0]["cpuTimeAbs"]
 
-        if not (info[0] in [libvirt.VIR_DOMAIN_SHUTOFF,
+        if not (info["state.state"] in [libvirt.VIR_DOMAIN_SHUTOFF,
                             libvirt.VIR_DOMAIN_CRASHED]):
-            guestcpus = info[3]
-            cpuTime = info[4] - prevCpuTime
-            cpuTimeAbs = info[4]
+            guestcpus = info["vcpu.current"]
+            cpuTime = info["cpu.time"] - prevCpuTime
+            cpuTimeAbs = info["cpu.time"]
             hostcpus = self.conn.host_active_processor_count()
 
             pcentbase = (((cpuTime) * 100.0) /
@@ -1709,7 +1707,7 @@ class vmmDomain(vmmLibvirtObject):
     # Polling helpers #
     ###################
 
-    def _sample_network_traffic(self):
+    def sample_network_traffic(self, info):
         rx = 0
         tx = 0
         if (not self._stats_net_supported or
@@ -1718,7 +1716,7 @@ class vmmDomain(vmmLibvirtObject):
             self._stats_net_skip = []
             return rx, tx
 
-        for netdev in self.get_interface_devices_norefresh():
+        for i, netdev in enumerate(self.get_interface_devices_norefresh()):
             dev = netdev.target_dev
             if not dev:
                 continue
@@ -1727,10 +1725,9 @@ class vmmDomain(vmmLibvirtObject):
                 continue
 
             try:
-                io = self._backend.interfaceStats(dev)
-                if io:
-                    rx += io[0]
-                    tx += io[4]
+                rx += info["net." + str(i) + ".rx.bytes"]
+                tx += info["net." + str(i) + ".tx.bytes"]
+
             except libvirt.libvirtError as err:
                 if util.is_error_nosupport(err):
                     logging.debug("Net stats not supported: %s", err)
@@ -1745,9 +1742,10 @@ class vmmDomain(vmmLibvirtObject):
                     else:
                         logging.debug("Aren't running, don't add to skiplist")
 
+
         return rx, tx
 
-    def _sample_disk_io(self):
+    def sample_disk_io(self, info):
         rd = 0
         wr = 0
         if (not self._stats_disk_supported or
@@ -1759,16 +1757,15 @@ class vmmDomain(vmmLibvirtObject):
         # Some drivers support this method for getting all usage at once
         if not self._summary_disk_stats_skip:
             try:
-                io = self._backend.blockStats('')
-                if io:
-                    rd = io[1]
-                    wr = io[3]
-                    return rd, wr
+                rd = info["block.0.rd.bytes"]
+                wr = info["block.0.wr.bytes"]
+                #io = self._backend.blockStats('')
+                return rd, wr
             except libvirt.libvirtError:
                 self._summary_disk_stats_skip = True
 
         # did not work, iterate over all disks
-        for disk in self.get_disk_devices_norefresh():
+        for i, disk in enumerate(self.get_disk_devices_norefresh()):
             dev = disk.target
             if not dev:
                 continue
@@ -1778,9 +1775,8 @@ class vmmDomain(vmmLibvirtObject):
 
             try:
                 io = self._backend.blockStats(dev)
-                if io:
-                    rd += io[1]
-                    wr += io[3]
+                rd = info["block." + str(i) + ".rd.bytes"]
+                wr = info["block." + str(i) + ".wr.bytes"]
             except libvirt.libvirtError as err:
                 if util.is_error_nosupport(err):
                     logging.debug("Disk stats not supported: %s", err)
@@ -1816,7 +1812,7 @@ class vmmDomain(vmmLibvirtObject):
         except Exception as e:
             logging.debug("Error setting memstats period: %s", e)
 
-    def _sample_mem_stats(self):
+    def sample_mem_stats(self, info):
         if (not self.mem_stats_supported or
             not self._enable_mem_stats or
             not self.is_active()):
@@ -1830,9 +1826,8 @@ class vmmDomain(vmmLibvirtObject):
         curmem = 0
         totalmem = 1
         try:
-            stats = self._backend.memoryStats()
-            totalmem = stats.get("actual", 1)
-            curmem = stats.get("rss", 0)
+            totalmem = info["balloon.current"]
+            curmem = info["balloon.rss"]
 
             if "unused" in stats:
                 curmem = max(0, totalmem - stats.get("unused", totalmem))
@@ -1843,6 +1838,37 @@ class vmmDomain(vmmLibvirtObject):
         pcentCurrMem = max(0.0, min(pcentCurrMem, 100.0))
 
         return pcentCurrMem, curmem
+
+    def _sample_all_stats(self, info, now):
+
+        connback = self.conn.get_backend()
+        dom = connback.lookupByName(self.get_name())
+        tmpinfo = connback.domainListGetStats(
+                  [dom],
+                  libvirt.VIR_DOMAIN_STATS_STATE |
+                  libvirt.VIR_DOMAIN_STATS_CPU_TOTAL |
+                  libvirt.VIR_DOMAIN_STATS_VCPU |
+                  libvirt.VIR_DOMAIN_STATS_BALLOON |
+                  libvirt.VIR_DOMAIN_STATS_BLOCK |
+                  libvirt.VIR_DOMAIN_STATS_INTERFACE,
+                  0)
+        info = tmpinfo[0][1]
+
+        #get cpu stats
+        (cpuTime, cpuTimeAbs,
+         pcentHostCpu, pcentGuestCpu) = self.sample_cpu_stats(info, now)
+
+        #get memory stats
+        pcentCurrMem, curmem = self.sample_mem_stats(info)
+
+        #get block stats
+        rdBytes, wrBytes = self.sample_disk_io(info)
+
+        #get interface stats
+        rxBytes, txBytes = self.sample_network_traffic(info)
+
+        return cpuTime, cpuTimeAbs, pcentHostCpu, pcentGuestCpu, pcentCurrMem, \
+               curmem, rdBytes, wrBytes, rxBytes, txBytes
 
 
     def tick(self, stats_update=True):
@@ -1860,8 +1886,8 @@ class vmmDomain(vmmLibvirtObject):
             info = self._backend.info()
             dosignal = self._refresh_status(newstatus=info[0], cansignal=False)
 
-        if stats_update:
-            self._tick_stats(info)
+#        if stats_update:
+#            self._tick_stats(info)
         if dosignal:
             self.idle_emit("state-changed")
         if stats_update:
@@ -1875,10 +1901,10 @@ class vmmDomain(vmmLibvirtObject):
 
         now = time.time()
         (cpuTime, cpuTimeAbs,
-         pcentHostCpu, pcentGuestCpu) = self._sample_cpu_stats(info, now)
-        pcentCurrMem, curmem = self._sample_mem_stats()
-        rdBytes, wrBytes = self._sample_disk_io()
-        rxBytes, txBytes = self._sample_network_traffic()
+         pcentHostCpu, pcentGuestCpu,
+         pcentCurrMem, curmem,
+         rdBytes, wrBytes,
+         rxBytes, txBytes) = self._sample_all_stats(info, now)
 
         newStats = {
             "timestamp": now,
